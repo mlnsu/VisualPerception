@@ -1,0 +1,66 @@
+# VisualPerception V1 配置
+# 路径一律相对项目根目录解析（由 src/config.py 完成），不依赖当前工作目录。
+
+project:
+  output_dir: outputs
+
+runtime:
+  device: auto            # auto | cpu | cuda:0
+  log_level: INFO
+
+camera:
+  source: 0               # 纯整数 -> 摄像头索引；带引号的字符串/路径 -> 视频文件
+  backend: dshow          # dshow | default（仅 Windows 摄像头生效）
+  width: 1280
+  height: 720
+  fps: 30
+  buffer_size: 1
+  loop_video: false
+  reconnect: true
+  reconnect_interval_s: 2.0
+
+model:
+  weights: models/yolo11n.pt
+  imgsz: 640
+  half: false
+  verbose: false
+
+detection:
+  conf: 0.10              # 喂给跟踪器的低阈值（ByteTrack 二段关联依赖低分框，勿改 0.25）
+  iou: 0.45
+  max_det: 300
+  classes: [0]            # 空列表 = 不过滤；默认只检测 person
+  display_conf: 0.30      # 仅用于绘制与 CSV
+
+tracking:
+  enabled: true
+  track_activation_threshold: 0.25
+  lost_track_buffer: 30
+  minimum_matching_threshold: 0.8
+  minimum_consecutive_frames: 1
+
+trajectory:
+  max_points: 200         # 每 ID 轨迹点上限（deque maxlen）
+  ttl_frames: 60          # 超过该帧数未见到的 ID 被回收
+
+motion:
+  window: 15              # 速度/方向估计的滑动窗口（点数）
+  min_points: 5           # 少于该点数不估计
+  pixels_per_meter: null  # V1 无标定；为 null 时速度只输出 px/s
+
+visualization:
+  enabled: true
+  window_name: VisualPerception
+  draw_trajectory: true
+  draw_speed: true
+  draw_hud: true
+  line_width: 2
+  font_scale: 0.5
+
+logging:
+  csv_enabled: true
+  csv_path: outputs/logs/detections.csv
+  csv_flush_every: 100
+
+performance:
+  fps_ema_decay: 0.9
