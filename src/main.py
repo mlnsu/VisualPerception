@@ -22,7 +22,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 
-from src.camera import FrameSource, ThreadedFrameSource
+from src.camera import FrameSource, ThreadedFrameSource, measure_capture_fps
 from src.config import PROJECT_ROOT, Config, load_config
 from src.csv_logger import CsvLogger
 from src.devices import (
@@ -42,6 +42,9 @@ logger = logging.getLogger("src.main")
 #: 退出按键：q / Q / ESC
 _EXIT_KEYS = frozenset((ord("q"), ord("Q"), 27))
 
+#: 采集测速前的预热帧数（MSMF 首帧出流约有 0.5s 启动延迟，避免污染计时）
+_CAPTURE_WARMUP_FRAMES = 5
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """解析 CLI 参数。"""
@@ -52,6 +55,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source", type=str, default=None, help="覆盖采集源：摄像头索引（如 0）、设备名或视频路径")
     parser.add_argument("--list-cameras", action="store_true", help="列出可用视频输入设备后退出（不加载模型）")
     parser.add_argument("--camera-name", type=str, default=None, help="按设备名打开摄像头（优先级高于配置 device_name）")
+    parser.add_argument(
+        "--bench-capture",
+        type=int,
+        default=None,
+        metavar="N",
+        help="只采集不推理：实测连续 N 帧的采集 FPS 后退出（不加载模型）",
+    )
     parser.add_argument("--headless", action="store_true", help="无窗口模式（服务器/自动化自检用）")
     parser.add_argument("--max-frames", type=int, default=None, help="最多处理帧数")
     parser.add_argument("--no-log", action="store_true", help="禁用 CSV 记录")
@@ -189,6 +199,68 @@ def run_list_cameras(max_index: int) -> int:
     return 0
 
 
+def _fmt_negotiated(neg: dict[str, float | str]) -> str:
+    """协商参数格式化为 ``1280x720@30.0 YUY2`` 样式。"""
+    return (
+        f"{neg.get('width', 0.0):g}x{neg.get('height', 0.0):g}"
+        f"@{float(neg.get('fps', 0.0)):.1f} {neg.get('fourcc') or '(默认)'}"
+    )
+
+
+def _warmup_capture(cap: cv2.VideoCapture, frames: int = _CAPTURE_WARMUP_FRAMES) -> None:
+    """采集测速前预热：MSMF 首帧出流有启动延迟，避免污染 60 帧计时。"""
+    for _ in range(frames):
+        if not cap.read()[0]:
+            break
+
+
+def _measure_capture_fps_standalone(cfg: Config, frames: int = 60) -> float | None:
+    """主循环结束后重开实时源，单独实测采集 FPS；失败返回 None。"""
+    probe = FrameSource(cfg.camera)
+    try:
+        probe.open()
+        cap = probe.capture
+        if cap is None:
+            return None
+        _warmup_capture(cap)
+        return measure_capture_fps(cap, frames)
+    except RuntimeError as exc:
+        logger.warning("采集测速失败（重开设备失败）: %s", exc)
+        return None
+    finally:
+        probe.close()
+
+
+def run_bench_capture(cfg: Config, frames: int, device_label: str) -> int:
+    """--bench-capture：只采集不推理，实测采集 FPS 后退出（不加载模型）。"""
+    source = FrameSource(cfg.camera)
+    if not source.is_live:
+        print("采集测速仅适用于实时摄像头源；当前为文件源，未执行。")
+        return 0
+    try:
+        source.open()
+        cap = source.capture
+        if cap is None:
+            logger.error("采集测速失败：未获得底层 VideoCapture")
+            return 1
+        _warmup_capture(cap)
+        fps = measure_capture_fps(cap, frames)
+        print("========== 采集测速 ==========")
+        print(f"采集源       : {device_label}")
+        print(f"后端         : {source.backend_name}")
+        print(f"协商参数     : {_fmt_negotiated(source.negotiated)}")
+        print(
+            f"实测采集 FPS : {fps:.1f}（连续 read {frames} 帧计时，"
+            f"另预热 {_CAPTURE_WARMUP_FRAMES} 帧不计时）"
+        )
+        return 0
+    except RuntimeError as exc:
+        logger.error("打开采集源失败: %s", exc)
+        return 1
+    finally:
+        source.close()
+
+
 def print_summary(
     processed: int,
     wall_elapsed: float,
@@ -197,17 +269,38 @@ def print_summary(
     sum_total_ms: float,
     max_track_id: int,
     csv_path: str,
+    capture_fps: float | None,
+    device_desc: str,
+    dropped_frames: int | None,
+    configured_fps: float,
 ) -> None:
-    """打印最终摘要（CLI 唯一允许的 print 输出）。"""
+    """打印最终摘要（CLI 唯一允许的 print 输出）。
+
+    采集 FPS（连续 read 实测）与处理 FPS（主循环端到端）分列，避免口径混淆。
+    """
     avg = lambda total: total / processed if processed else 0.0  # noqa: E731
     print("========== 运行摘要 ==========")
     print(f"处理帧数     : {processed}")
-    print(f"平均 FPS     : {processed / wall_elapsed:.1f}（口径：主循环端到端，含读帧/推理/绘制/写出）")
+    if capture_fps is None:
+        print("采集 FPS     : 不适用（文件源）")
+    else:
+        print(f"采集 FPS     : {capture_fps:.1f}（连续 read 实测）")
+    print(f"处理 FPS     : {processed / wall_elapsed:.1f}（主循环端到端，含推理/绘制/写出）")
+    print(f"采集设备     : {device_desc}")
+    if dropped_frames is None:
+        print("丢帧数       : 不适用（文件源）")
+    else:
+        print(f"丢帧数       : {dropped_frames}（队列满丢旧帧）")
     print(f"平均检测耗时 : {avg(sum_detect_ms):.1f} ms")
     print(f"平均跟踪耗时 : {avg(sum_track_ms):.1f} ms")
     print(f"平均处理耗时 : {avg(sum_total_ms):.1f} ms（pipeline 端到端）")
     print(f"最大 Track ID: {max_track_id}")
     print(f"CSV 路径     : {csv_path}")
+    if capture_fps is not None and capture_fps < 0.7 * configured_fps:
+        print(
+            f"WARNING      : 实际采集帧率 {capture_fps:.1f} 低于配置值 "
+            f"{configured_fps:.1f} 的 70%，请检查后端/分辨率设置"
+        )
 
 
 def run(args: argparse.Namespace) -> int:
@@ -223,6 +316,12 @@ def run(args: argparse.Namespace) -> int:
     if resolved is None:
         return 1  # 名字匹配失败：错误信息已列出可用设备
     cfg, device_label = resolved
+
+    if args.bench_capture is not None:
+        if args.bench_capture <= 0:
+            logger.error("--bench-capture N 必须 > 0")
+            return 1
+        return run_bench_capture(cfg, args.bench_capture, device_label)
 
     device = resolve_device(cfg.runtime.device)
     logger.info("推理设备: %s", device)
@@ -254,7 +353,8 @@ def run(args: argparse.Namespace) -> int:
     video_path: Path | None = None
 
     source: FrameSource | ThreadedFrameSource = FrameSource(cfg.camera)
-    if source.is_live:
+    was_live = source.is_live
+    if was_live:
         source = ThreadedFrameSource(source)
 
     processed = 0
@@ -264,12 +364,14 @@ def run(args: argparse.Namespace) -> int:
     max_track_id = 0
     loop_start = time.perf_counter()
     wall_start = time.perf_counter()
+    device_desc = f"{device_label} / (未打开)"
 
     try:
         with source:
             # 设备打开/重协商耗时可能很长（MSMF 实测约 11s），不计入处理 FPS 口径
             loop_start = time.perf_counter()
             neg = source.negotiated
+            device_desc = f"{device_label} / {source.backend_name} / {_fmt_negotiated(neg)}"
             logger.info(
                 "采集设备: %s | 后端: %s | 协商: %gx%g@%.1f %s",
                 device_label,
@@ -347,6 +449,19 @@ def run(args: argparse.Namespace) -> int:
         visualizer.close()
 
     wall_elapsed = max(time.perf_counter() - loop_start, 1e-9)
+
+    # 采集 FPS 与处理 FPS 分列：主循环结束后重开实时源单独测速（文件源不适用）
+    capture_fps: float | None = None
+    if was_live:
+        capture_fps = _measure_capture_fps_standalone(cfg)
+        if capture_fps is not None and capture_fps < 0.7 * cfg.camera.fps:
+            logger.warning(
+                "实际采集帧率 %.1f 低于配置值 %.1f 的 70%%，请检查后端/分辨率设置",
+                capture_fps,
+                cfg.camera.fps,
+            )
+    dropped_frames = source.dropped_frames if isinstance(source, ThreadedFrameSource) else None
+
     print_summary(
         processed,
         wall_elapsed,
@@ -355,6 +470,10 @@ def run(args: argparse.Namespace) -> int:
         sum_total_ms,
         max_track_id,
         str(cfg.logging.csv_path) if csv_logger is not None else "未启用",
+        capture_fps,
+        device_desc,
+        dropped_frames,
+        cfg.camera.fps,
     )
     return 0
 
