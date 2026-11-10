@@ -46,17 +46,22 @@ class CameraConfig:
     """采集源设置。
 
     source 为 int 时表示摄像头索引；为 str 时表示视频文件路径或 URL。
+    device_name 非空时优先按名字解析摄像头（source 作为兜底说明）。
+    backend: auto | msmf | dshow | default；fourcc 为空或恰好 4 字符。
     """
 
     source: int | str
+    device_name: str
     backend: str
     width: int
     height: int
     fps: float
+    fourcc: str
     buffer_size: int
     loop_video: bool
     reconnect: bool
     reconnect_interval_s: float
+    probe_max_index: int
 
 
 @dataclass(frozen=True)
@@ -164,14 +169,17 @@ DEFAULTS: dict[str, Any] = {
     "runtime": {"device": "auto", "log_level": "INFO"},
     "camera": {
         "source": 0,
-        "backend": "dshow",
+        "device_name": "",
+        "backend": "auto",
         "width": 1280,
         "height": 720,
         "fps": 30,
+        "fourcc": "",
         "buffer_size": 1,
         "loop_video": False,
         "reconnect": True,
         "reconnect_interval_s": 2.0,
+        "probe_max_index": 4,
     },
     "model": {
         "weights": "models/yolo11n.pt",
@@ -256,8 +264,12 @@ def _require_int(raw: Any, key: str) -> int:
     return int(raw)
 
 
+#: camera.backend 的合法取值
+_VALID_BACKENDS = ("auto", "msmf", "dshow", "default")
+
+
 def _build_camera(raw: dict[str, Any]) -> CameraConfig:
-    """构建并校验 CameraConfig（重点：source 的 int/str 判别）。"""
+    """构建并校验 CameraConfig（重点：source 的 int/str 判别与 backend/fourcc 校验）。"""
     source_raw = raw["source"]
     if isinstance(source_raw, bool) or not isinstance(source_raw, (int, str)):
         raise ConfigError(
@@ -272,18 +284,37 @@ def _build_camera(raw: dict[str, Any]) -> CameraConfig:
     else:
         source = str(_resolve_path(source_raw))
 
+    backend = str(raw["backend"]).strip().lower()
+    if backend not in _VALID_BACKENDS:
+        raise ConfigError(
+            f"camera.backend 必须是 {'|'.join(_VALID_BACKENDS)} 之一，实际为 {raw['backend']!r}"
+        )
+
+    fourcc = str(raw["fourcc"]).strip().upper()
+    if fourcc and len(fourcc) != 4:
+        raise ConfigError(
+            f"camera.fourcc 必须为空或恰好 4 个字符（如 MJPG/YUY2），实际为 {raw['fourcc']!r}"
+        )
+
+    probe_max_index = _require_int(raw["probe_max_index"], "camera.probe_max_index")
+    if probe_max_index < 0:
+        raise ConfigError("camera.probe_max_index 必须 >= 0")
+
     return CameraConfig(
         source=source,
-        backend=str(raw["backend"]),
+        device_name=str(raw["device_name"]).strip(),
+        backend=backend,
         width=_require_int(raw["width"], "camera.width"),
         height=_require_int(raw["height"], "camera.height"),
         fps=_require_number(raw["fps"], "camera.fps"),
+        fourcc=fourcc,
         buffer_size=_require_int(raw["buffer_size"], "camera.buffer_size"),
         loop_video=bool(raw["loop_video"]),
         reconnect=bool(raw["reconnect"]),
         reconnect_interval_s=_require_number(
             raw["reconnect_interval_s"], "camera.reconnect_interval_s"
         ),
+        probe_max_index=probe_max_index,
     )
 
 

@@ -171,6 +171,8 @@ def run(args: argparse.Namespace) -> int:
 
     try:
         with source:
+            # 设备打开/重协商耗时可能很长（MSMF 实测约 11s），不计入处理 FPS 口径
+            loop_start = time.perf_counter()
             frame_index = 0
             while True:
                 if args.max_frames is not None and processed >= args.max_frames:

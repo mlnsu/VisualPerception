@@ -9,15 +9,18 @@ runtime:
   log_level: INFO
 
 camera:
-  source: 0               # 纯整数 -> 摄像头索引；带引号的字符串/路径 -> 视频文件
-  backend: dshow          # dshow | default（仅 Windows 摄像头生效）
+  source: 0                        # 整数索引；device_name 非空时优先按名字解析，本键作兜底
+  device_name: "Astra Pro HD Camera"  # 按名字匹配摄像头；空字符串 = 不按名字匹配，仅用 source
+  backend: auto                    # auto | msmf | dshow | default
   width: 1280
   height: 720
   fps: 30
+  fourcc: ""                       # 空 = 不指定；"MJPG" / "YUY2" 强制
   buffer_size: 1
   loop_video: false
   reconnect: true
   reconnect_interval_s: 2.0
+  probe_max_index: 4               # --list-cameras 的探测上限
 
 model:
   weights: models/yolo11n.pt
