@@ -103,3 +103,30 @@ def test_top_level_not_mapping_raises(tmp_path):
     path.write_text("- a\n- b\n", encoding="utf-8")
     with pytest.raises(ConfigError):
         load_config(path)
+
+
+def test_camera_new_keys_defaults(tmp_path):
+    """新增 camera 键（device_name/backend/fourcc/probe_max_index）的默认值合并。"""
+    cfg = load_config(tmp_path / "nope.yaml")
+    assert cfg.camera.device_name == ""
+    assert cfg.camera.backend == "auto"
+    assert cfg.camera.fourcc == ""
+    assert cfg.camera.probe_max_index == 4
+
+
+def test_camera_backend_invalid_raises(tmp_path):
+    """backend 非法值抛 ConfigError 并指明键名。"""
+    path = write_yaml(tmp_path, "camera:\n  backend: vfw\n")
+    with pytest.raises(ConfigError, match="camera.backend"):
+        load_config(path)
+
+
+def test_camera_fourcc_length_validation(tmp_path):
+    """fourcc 为空或恰好 4 字符合法（归一化为大写）；其他长度抛 ConfigError。"""
+    assert load_config(write_yaml(tmp_path, 'camera:\n  fourcc: "MJPG"\n')).camera.fourcc == "MJPG"
+    assert load_config(write_yaml(tmp_path, 'camera:\n  fourcc: "mjpg"\n')).camera.fourcc == "MJPG"
+    assert load_config(write_yaml(tmp_path, 'camera:\n  fourcc: ""\n')).camera.fourcc == ""
+    with pytest.raises(ConfigError, match="camera.fourcc"):
+        load_config(write_yaml(tmp_path, 'camera:\n  fourcc: "MJP"\n'))
+    with pytest.raises(ConfigError, match="camera.fourcc"):
+        load_config(write_yaml(tmp_path, 'camera:\n  fourcc: "MJPGX"\n'))

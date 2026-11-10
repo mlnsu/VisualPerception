@@ -108,7 +108,8 @@ VisualPerception/
 ├── src/
 │   ├── config.py            # 配置加载 + 默认值合并 + 路径解析
 │   ├── datatypes.py         # Detection / Track / TrackHistory / FrameResult
-│   ├── camera.py            # FrameSource（含实时线程化采集）
+│   ├── camera.py            # FrameSource（含实时线程化采集/后端选择/采集测速）
+│   ├── devices.py           # 视频设备枚举与按名字解析（可选 pygrabber）
 │   ├── detector.py          # YOLO11n 检测封装（只出框）
 │   ├── tracker.py           # 独立 sv.ByteTrack 跟踪封装
 │   ├── trajectory.py        # 轨迹历史（deque + TTL 淘汰）
@@ -142,6 +143,8 @@ VisualPerception/
 - RAM：建议 16GB
 - GPU：支持 CPU 推理；如有 NVIDIA GPU，可配置 CUDA 加速
 - Camera：USB 摄像头或其他视频输入设备（无摄像头时可用 `--source <视频文件>` 替代）
+- 本机验证设备：Orbbec Astra Pro HD Camera（VID_2BC5&PID_0501，仅使用彩色 UVC 流；深度接口 V1 不使用）
+- 可选增强：`pip install pygrabber` 后支持按设备名打开摄像头与 `--list-cameras` 显示设备名（不写入 requirements.txt）
 
 ### 创建虚拟环境
 
@@ -185,11 +188,35 @@ cd VisualPerception
 python src/main.py
 ```
 
-默认使用编号为 0 的摄像头。
+默认按配置 `camera.device_name` 打开（本仓库配置指向 Astra Pro HD Camera，解析到索引 1）；
+`device_name` 为空时才使用 `camera.source` 指定的索引。若本机没有该设备，
+请清空 `device_name` 或用 `--source` 显式指定。
 
 按 `Q` 键退出实时检测窗口。
 
-### 7.4 视频文件输入与无窗口模式
+### 7.4 摄像头选择与采集测速
+
+```bash
+# 列出可用视频设备（索引 / 设备名 / 能否打开 / 协商分辨率 / fourcc）
+python src/main.py --list-cameras
+
+# 按设备名打开摄像头（推荐，避免索引漂移；找不到该名字时非零退出并列出可用设备）
+python src/main.py --camera-name "Astra Pro HD Camera"
+
+# 只测采集帧率，不加载模型（连续 N 帧计时，另预热 5 帧不计时）
+python src/main.py --bench-capture 60 --source 1
+```
+
+摄像头相关的源解析优先级：`--source`（索引/设备名/路径）> `--camera-name` > 配置
+`camera.device_name` > 配置 `camera.source`。
+
+Windows 采集后端建议：**720p 优先 MSMF**（`config.yaml` 中 `backend: auto` 即可），
+DSHOW 在 720p（YUY2）下只有约 10 FPS，640x480 两者均可。
+Astra Pro 实测（`--bench-capture 60`，1280×720）：MSMF 29.5 FPS / DSHOW 约 10 FPS。
+注意 MSMF 打开设备较慢（实测约 8~11s，每次触发分辨率重协商约 +3.4s），属正常现象；
+该耗时不计入处理 FPS 口径。
+
+### 7.5 视频文件输入与无窗口模式
 
 ```bash
 # 视频文件 + headless（无窗口，服务器/自动化自检）
@@ -210,8 +237,9 @@ camera:
   source: "data/videos/test.mp4"
 ```
 
-运行结束后输出摘要（处理帧数 / 平均 FPS / 平均检测与跟踪耗时 / 最大 Track ID / CSV 路径），
-逐帧明细写入 `outputs/logs/detections.csv`（Pandas 可直读）。
+运行结束后输出摘要，**采集 FPS 与处理 FPS 分列**并给出丢帧数
+（处理帧数 / 采集 FPS / 处理 FPS / 采集设备与后端 / 丢帧数 / 平均检测与跟踪耗时 /
+最大 Track ID / CSV 路径），逐帧明细写入 `outputs/logs/detections.csv`（Pandas 可直读）。
 
 ## 8. 核心功能
 
