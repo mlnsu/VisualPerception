@@ -20,3 +20,6 @@ data/videos/*.avi
 # 临时文件
 *.log
 .DS_Store
+
+# Trae 本地配置（rules/skills）
+.trae/
