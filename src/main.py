@@ -25,6 +25,12 @@ import numpy as np
 from src.camera import FrameSource, ThreadedFrameSource
 from src.config import PROJECT_ROOT, Config, load_config
 from src.csv_logger import CsvLogger
+from src.devices import (
+    device_names,
+    get_device_name,
+    list_devices,
+    resolve_index_by_name,
+)
 from src.detector import Detector
 from src.pipeline import PerceptionPipeline
 from src.tracker import Tracker
@@ -43,7 +49,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="src.main", description="VisualPerception V1 实时感知 CLI"
     )
     parser.add_argument("--config", type=str, default=None, help="配置文件路径（默认 configs/config.yaml）")
-    parser.add_argument("--source", type=str, default=None, help="覆盖采集源：摄像头索引（如 0）或视频路径")
+    parser.add_argument("--source", type=str, default=None, help="覆盖采集源：摄像头索引（如 0）、设备名或视频路径")
+    parser.add_argument("--list-cameras", action="store_true", help="列出可用视频输入设备后退出（不加载模型）")
+    parser.add_argument("--camera-name", type=str, default=None, help="按设备名打开摄像头（优先级高于配置 device_name）")
     parser.add_argument("--headless", action="store_true", help="无窗口模式（服务器/自动化自检用）")
     parser.add_argument("--max-frames", type=int, default=None, help="最多处理帧数")
     parser.add_argument("--no-log", action="store_true", help="禁用 CSV 记录")
@@ -78,10 +86,18 @@ def resolve_device(device: str) -> str:
         return "cpu"
 
 
-def resolve_cli_source(raw: str) -> int | str:
-    """解析 --source：纯数字为摄像头索引，否则为路径（相对 CWD 优先，其次项目根）。"""
+def resolve_cli_source(raw: str, probe_max: int | None = None) -> int | str:
+    """解析 --source：纯数字为索引；否则先按设备名匹配；最后按路径。
+
+    路径口径：绝对路径 -> 相对 CWD -> 相对项目根。
+    """
     if raw.isdigit():
         return int(raw)
+    if probe_max is None:
+        probe_max = 4  # 与 DEFAULTS camera.probe_max_index 一致的兜底值
+    index = resolve_index_by_name(raw, probe_max)
+    if index is not None:
+        return index
     path = Path(raw)
     if path.is_absolute():
         return str(path)
@@ -93,12 +109,84 @@ def resolve_cli_source(raw: str) -> int | str:
 def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
     """把 CLI 参数覆盖进配置（返回新 Config，不改原对象）。"""
     if args.source is not None:
-        cfg = dataclasses.replace(cfg, camera=dataclasses.replace(cfg.camera, source=resolve_cli_source(args.source)))
+        resolved = resolve_cli_source(args.source, cfg.camera.probe_max_index)
+        cfg = dataclasses.replace(cfg, camera=dataclasses.replace(cfg.camera, source=resolved))
     if args.device is not None:
         cfg = dataclasses.replace(cfg, runtime=dataclasses.replace(cfg.runtime, device=args.device))
     if args.log_level is not None:
         cfg = dataclasses.replace(cfg, runtime=dataclasses.replace(cfg.runtime, log_level=args.log_level))
     return cfg
+
+
+def _describe_source(source: int | str) -> str:
+    """给日志/摘要用的采集源描述。"""
+    if isinstance(source, int):
+        name = get_device_name(source)
+        return f"{name} (idx {source})" if name else f"摄像头 (idx {source})"
+    return str(source)
+
+
+def resolve_capture_target(cfg: Config, args: argparse.Namespace) -> tuple[Config, str] | None:
+    """按优先级解析最终采集源：--source > --camera-name > device_name > source。
+
+    Returns:
+        (新配置, 设备描述)；名字匹配失败时返回 None（调用方以非零码退出）。
+    """
+    if args.source is not None:
+        # 已在 apply_overrides 中解析（数字/设备名/路径）
+        return cfg, _describe_source(cfg.camera.source)
+
+    name: str | None = None
+    if args.camera_name is not None:
+        name = args.camera_name
+    elif cfg.camera.device_name:
+        name = cfg.camera.device_name
+
+    if name is not None:
+        index = resolve_index_by_name(name, cfg.camera.probe_max_index)
+        if index is None:
+            available = device_names()
+            if available:
+                logger.error(
+                    "按名字找不到摄像头 %r；实际可用设备：%s",
+                    name,
+                    ", ".join(f"{idx}:{dev}" for idx, dev in enumerate(available)),
+                )
+            else:
+                logger.error(
+                    "按名字找不到摄像头 %r；且无法枚举设备名"
+                    "（安装可选依赖 pygrabber 后可按名字匹配，或改用 --list-cameras / --source）",
+                    name,
+                )
+            return None
+        logger.info("按设备名 %r 解析到摄像头索引 %d", name, index)
+        cfg = dataclasses.replace(cfg, camera=dataclasses.replace(cfg.camera, source=index))
+        return cfg, f"{name} (idx {index})"
+
+    return cfg, _describe_source(cfg.camera.source)
+
+
+def run_list_cameras(max_index: int) -> int:
+    """--list-cameras：列出视频设备后退出（不加载模型）。无设备时以 0 退出。"""
+    logger.info("开始探测视频输入设备（索引 0..%d，MSMF 后端）", max(0, max_index - 1))
+    devices = list_devices(max_index)
+    usable = [d for d in devices if d.opens]
+    print("========== 视频输入设备 ==========")
+    if not usable:
+        print(f"未检测到可打开的视频输入设备（已探测索引 0..{max(0, max_index - 1)}）。")
+        print("请确认设备已连接且未被其他程序占用；无摄像头时可用 --source <视频文件> 运行。")
+        return 0
+    print("索引  可打开  设备名                       协商分辨率  fourcc")
+    for d in devices:
+        name = d.name or "(未知)"
+        if d.opens:
+            res = f"{d.width}x{d.height}"
+            fourcc = d.fourcc or "(默认)"
+            mark = "是"
+        else:
+            res, fourcc, mark = "-", "-", "否"
+        print(f"{d.index:<5} {mark:<6}  {name:<28} {res:<11} {fourcc}")
+    return 0
 
 
 def print_summary(
@@ -123,10 +211,18 @@ def print_summary(
 
 
 def run(args: argparse.Namespace) -> int:
-    """主流程：加载配置 -> 初始化组件 -> 主循环 -> 摘要。"""
+    """主流程：加载配置 -> 解析源 -> 初始化组件 -> 主循环 -> 摘要。"""
     cfg = apply_overrides(load_config(args.config), args)
     setup_logging(cfg.runtime.log_level)
     logger.info("配置加载完成（device=%s, source=%s）", cfg.runtime.device, cfg.camera.source)
+
+    if args.list_cameras:
+        return run_list_cameras(cfg.camera.probe_max_index)
+
+    resolved = resolve_capture_target(cfg, args)
+    if resolved is None:
+        return 1  # 名字匹配失败：错误信息已列出可用设备
+    cfg, device_label = resolved
 
     device = resolve_device(cfg.runtime.device)
     logger.info("推理设备: %s", device)
@@ -173,6 +269,16 @@ def run(args: argparse.Namespace) -> int:
         with source:
             # 设备打开/重协商耗时可能很长（MSMF 实测约 11s），不计入处理 FPS 口径
             loop_start = time.perf_counter()
+            neg = source.negotiated
+            logger.info(
+                "采集设备: %s | 后端: %s | 协商: %gx%g@%.1f %s",
+                device_label,
+                source.backend_name,
+                neg.get("width", 0.0),
+                neg.get("height", 0.0),
+                float(neg.get("fps", 0.0)),
+                neg.get("fourcc") or "(默认格式)",
+            )
             frame_index = 0
             while True:
                 if args.max_frames is not None and processed >= args.max_frames:
