@@ -171,7 +171,7 @@ python -m pip install -r requirements.txt
 ### 7.1 下载项目
 
 ```bash
-git clone https://github.com/你的用户名/VisualPerception.git
+git clone https://github.com/mlnsu/VisualPerception.git
 
 cd VisualPerception
 ```
